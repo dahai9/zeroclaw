@@ -77,9 +77,8 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    build_shell_policy_instructions, build_tool_instructions_from_specs,
-    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
-    NonCliApprovalPrompt, SafetyHeartbeatConfig,
+    build_shell_policy_instructions, run_tool_call_loop_with_non_cli_approval_context,
+    scrub_credentials, NonCliApprovalContext, NonCliApprovalPrompt, SafetyHeartbeatConfig,
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
@@ -357,6 +356,7 @@ struct ChannelRuntimeContext {
     approval_manager: Arc<ApprovalManager>,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
+    tool_rag_index: Option<Arc<crate::tools::tool_rag::ToolRagIndex>>,
 }
 
 #[derive(Clone)]
@@ -1338,69 +1338,6 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .clone()
 }
 
-fn filtered_tool_specs_for_runtime(
-    tools_registry: &[Box<dyn Tool>],
-    excluded_tools: &[String],
-) -> Vec<crate::tools::ToolSpec> {
-    tools_registry
-        .iter()
-        .map(|tool| tool.spec())
-        .filter(|spec| !excluded_tools.iter().any(|excluded| excluded == &spec.name))
-        .collect()
-}
-
-fn build_runtime_tool_visibility_prompt(
-    tools_registry: &[Box<dyn Tool>],
-    excluded_tools: &[String],
-    native_tools: bool,
-) -> String {
-    let mut prompt = String::new();
-    let mut specs = filtered_tool_specs_for_runtime(tools_registry, excluded_tools);
-    specs.sort_by(|a, b| a.name.cmp(&b.name));
-
-    use std::fmt::Write;
-    prompt.push_str("\n## Runtime Tool Availability (Authoritative)\n\n");
-    prompt.push_str(
-        "This section is generated from current runtime policy for this message. \
-         Only the listed tools may be called in this turn.\n\n",
-    );
-
-    if specs.is_empty() {
-        prompt.push_str("- Allowed tools: (none)\n");
-    } else {
-        let _ = writeln!(prompt, "- Allowed tools ({}):", specs.len());
-        for spec in &specs {
-            let _ = writeln!(prompt, "  - `{}`", spec.name);
-        }
-    }
-
-    if excluded_tools.is_empty() {
-        prompt.push_str("- Excluded by runtime policy: (none)\n\n");
-    } else {
-        let mut excluded_sorted = excluded_tools.to_vec();
-        excluded_sorted.sort();
-        let _ = writeln!(
-            prompt,
-            "- Excluded by runtime policy: {}\n",
-            excluded_sorted.join(", ")
-        );
-    }
-
-    if native_tools {
-        prompt.push_str(
-            "Tool calling for this turn uses native provider function-calling. \
-             Do not emit `<tool_call>` XML tags.\n",
-        );
-    } else {
-        prompt.push_str(
-            "Tool calling for this turn uses XML tool protocol below. \
-             This protocol block is generated from the same runtime policy snapshot.\n",
-        );
-        prompt.push_str(&build_tool_instructions_from_specs(&specs));
-    }
-
-    prompt
-}
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
@@ -3900,17 +3837,12 @@ If this input is legitimate, rephrase the request and avoid instruction-override
     } else {
         snapshot_non_cli_excluded_tools(ctx.as_ref())
     };
-    let mut system_prompt = build_channel_system_prompt(
+    let system_prompt = build_channel_system_prompt(
         ctx.system_prompt.as_str(),
         &msg.channel,
         &msg.reply_target,
         expose_internal_tool_details,
     );
-    system_prompt.push_str(&build_runtime_tool_visibility_prompt(
-        ctx.tools_registry.as_ref(),
-        &excluded_tools_snapshot,
-        active_provider.supports_native_tools(),
-    ));
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
@@ -4110,6 +4042,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     progress_mode,
                     ctx.safety_heartbeat.clone(),
                     runtime_canary_tokens_snapshot(ctx.as_ref()),
+                    ctx.tool_rag_index.as_deref(),
                 ),
             ),
         ) => LlmExecutionResult::Completed(result),
@@ -4732,6 +4665,7 @@ pub fn build_system_prompt(
         bootstrap_max_chars,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
+        crate::config::ToolsInjectionMode::Full,
     )
 }
 
@@ -4744,12 +4678,21 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    tools_injection_mode: crate::config::ToolsInjectionMode,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if tools_injection_mode == crate::config::ToolsInjectionMode::Rag {
+        prompt.push_str("## Tools\n\n");
+        prompt.push_str(
+            "You are running with dynamic tool selection (Tools RAG).\n\
+            The exact tools available to you on this turn are provided separately below or strictly via native API tool definitions.\n\
+            \nNote: If you need a tool not currently listed in your API tools array, describe what capability \
+            you need and additional relevant tools will be automatically discovered and provided in the next turn.\n\n"
+        );
+    } else if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
         prompt.push_str("You have access to the following tools:\n\n");
         for (name, desc) in tools {
@@ -5943,11 +5886,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.tools_injection_mode,
     );
-    if !native_tools {
-        let filtered_specs = filtered_tool_specs_for_runtime(tools_registry.as_ref(), excluded);
-        system_prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
-    }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     if !skills.is_empty() {
@@ -6075,6 +6015,38 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
         .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
 
+    // ── Tools RAG: dynamic tool injection ─────────────────────────
+    let tool_rag_index: Option<Arc<crate::tools::tool_rag::ToolRagIndex>> = if matches!(
+        config.agent.tools_injection_mode,
+        crate::config::schema::ToolsInjectionMode::Rag
+    ) {
+        let index = crate::tools::tool_rag::ToolRagIndex::new(
+            Arc::clone(&mem),
+            config.agent.tools_rag_core_set.clone(),
+            config.agent.tools_rag_top_k,
+            config.agent.tools_rag_threshold,
+            config.agent.tools_rag_enable_discovery,
+            config.agent.tools_rag_cache_window,
+        );
+        match index
+            .register_tools(tools_registry.as_ref(), provider.as_ref(), &model)
+            .await
+        {
+            Ok(report) => {
+                println!(
+                    "  🔧 Tools RAG: registered {} new, {} skipped (total {})",
+                    report.registered, report.skipped, report.total
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Tools RAG registration failed: {e}; falling back to full mode");
+            }
+        }
+        Some(Arc::new(index))
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -6124,6 +6096,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        tool_rag_index,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -6469,6 +6442,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6526,6 +6500,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6586,6 +6561,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -7187,40 +7163,6 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    #[test]
-    fn build_runtime_tool_visibility_prompt_respects_excluded_snapshot() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool), Box::new(MockEchoTool)];
-        let excluded = vec!["mock_price".to_string()];
-
-        let non_native = build_runtime_tool_visibility_prompt(&tools, &excluded, false);
-        assert!(non_native.contains("Runtime Tool Availability (Authoritative)"));
-        assert!(non_native.contains("Excluded by runtime policy: mock_price"));
-        assert!(non_native.contains("`mock_echo`"));
-        assert!(!non_native.contains("**mock_price**:"));
-        assert!(non_native.contains("## Tool Use Protocol"));
-
-        let native = build_runtime_tool_visibility_prompt(&tools, &excluded, true);
-        assert!(native.contains("Runtime Tool Availability (Authoritative)"));
-        assert!(native.contains("native provider function-calling"));
-        assert!(!native.contains("## Tool Use Protocol"));
-    }
-
-    #[test]
-    fn build_runtime_tool_visibility_prompt_excludes_process_with_default_policy() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockProcessTool), Box::new(MockEchoTool)];
-        let excluded = crate::config::AutonomyConfig::default().non_cli_excluded_tools;
-
-        assert!(
-            excluded.contains(&"process".to_string()),
-            "default non-CLI exclusion list must include process"
-        );
-
-        let prompt = build_runtime_tool_visibility_prompt(&tools, &excluded, false);
-        assert!(prompt.contains("Excluded by runtime policy:"));
-        assert!(prompt.contains("process"));
-        assert!(!prompt.contains("**process**:"));
-        assert!(prompt.contains("`mock_echo`"));
-    }
 
     #[tokio::test]
     async fn process_channel_message_injects_runtime_tool_visibility_prompt() {
@@ -7269,6 +7211,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7356,6 +7299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7430,6 +7374,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7518,6 +7463,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7605,6 +7551,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7677,6 +7624,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7751,6 +7699,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7827,6 +7776,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -7934,6 +7884,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
         assert_eq!(
             runtime_ctx
@@ -8072,6 +8023,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8161,6 +8113,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8239,6 +8192,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         let runtime_ctx_for_first_turn = runtime_ctx.clone();
@@ -8403,6 +8357,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
         assert_eq!(
             runtime_ctx
@@ -8518,6 +8473,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8628,6 +8584,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8720,6 +8677,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8822,6 +8780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -8925,6 +8884,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9076,6 +9036,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -9173,6 +9134,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9323,6 +9285,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9443,6 +9406,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9543,6 +9507,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9662,6 +9627,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9782,6 +9748,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9861,6 +9828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -9971,6 +9939,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -10169,6 +10138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -10374,6 +10344,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -10442,6 +10413,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -10624,6 +10596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -10714,6 +10687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10816,6 +10790,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10900,6 +10875,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -10969,6 +10945,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -11227,6 +11204,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             false,
             crate::config::SkillsPromptInjectionMode::Compact,
+            crate::config::ToolsInjectionMode::Full,
         );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
@@ -11648,6 +11626,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -11744,6 +11723,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -11839,6 +11819,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -11938,6 +11919,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -12766,6 +12748,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -12842,6 +12825,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            tool_rag_index: None,
         });
 
         process_channel_message(

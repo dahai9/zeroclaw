@@ -444,6 +444,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            tools_injection_mode: self.config.tools_injection_mode,
         };
         self.prompt_builder.build(&ctx)
     }

@@ -995,6 +995,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     TOOL_LOOP_CANARY_TOKENS_ENABLED
         .scope(
@@ -1016,6 +1017,7 @@ pub(crate) async fn agent_turn(
                 None,
                 None,
                 &[],
+                tool_rag_index,
             ),
         )
         .await
@@ -1043,6 +1045,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     progress_mode: ProgressMode,
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     TOOL_LOOP_PROGRESS_MODE
         .scope(
@@ -1068,6 +1071,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
                         on_delta,
                         hooks,
                         excluded_tools,
+                        tool_rag_index,
                     ),
                 ),
             ),
@@ -1098,6 +1102,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     progress_mode: ProgressMode,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     canary_tokens_enabled: bool,
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -1131,6 +1136,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
                                 on_delta,
                                 hooks,
                                 excluded_tools,
+                                tool_rag_index,
                             ),
                         ),
                     ),
@@ -1172,6 +1178,7 @@ pub async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
         .try_with(Clone::clone)
@@ -1193,11 +1200,39 @@ pub async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
-        .collect();
+    let mut tool_specs: Vec<crate::tools::ToolSpec> = if let Some(rag_index) = tool_rag_index {
+        // RAG mode: extract user message from history for semantic tool selection
+        let user_msg = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let selected_names = rag_index.select_tools(user_msg).await.unwrap_or_default();
+        tracing::info!(
+            mode = "rag",
+            selected_count = selected_names.len(),
+            selected = ?selected_names,
+            "Tool RAG: initial tool selection"
+        );
+        tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .filter(|tool| selected_names.contains(tool.name()))
+            .map(|tool| tool.spec())
+            .collect()
+    } else {
+        tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .map(|tool| tool.spec())
+            .collect()
+    };
+    // Track which tool names are currently in tool_specs for dynamic expansion
+    let mut selected_tool_names: std::collections::HashSet<String> =
+        tool_specs.iter().map(|s| s.name.clone()).collect();
+    // Track whether SubAgent discovery has been used this turn (one-shot guard)
+    let mut discovery_used = false;
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1282,6 +1317,21 @@ pub async fn run_tool_call_loop(
         )
         .await?;
         let mut request_messages = prepared_messages.messages.clone();
+
+        // ── Inject Authoritative Tool Visibility Prompt ───────────
+        let mut excluded_tools_sorted = excluded_tools.to_vec();
+        excluded_tools_sorted.sort();
+        let visibility_prompt = build_runtime_tool_visibility_prompt(
+            &tool_specs,
+            &excluded_tools_sorted,
+            use_native_tools,
+        );
+        if let Some(msg) = request_messages.iter_mut().find(|m| m.role == "system") {
+            msg.content.push_str(&visibility_prompt);
+        } else {
+            request_messages.insert(0, ChatMessage::system(visibility_prompt));
+        }
+
         if let Some(prompt) = missing_tool_call_retry_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));
         }
@@ -1531,6 +1581,7 @@ pub async fn run_tool_call_loop(
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
+            turn_reasoning_content,
         ) = match chat_result {
             Ok(resp) => {
                 let mut response_text = resp.text_or_empty().to_string();
@@ -1818,6 +1869,7 @@ pub async fn run_tool_call_loop(
                     assistant_history_content,
                     native_calls,
                     parse_issue.is_some(),
+                    reasoning_content,
                 )
             }
             Err(e) => {
@@ -1892,6 +1944,98 @@ pub async fn run_tool_call_loop(
                             tool_calls.len()
                         ))
                         .await;
+                }
+            }
+        }
+
+        // ── Dynamic tool expansion (Tools RAG) ───────────────────
+        // Trigger A: LLM called a tool that exists in tools_registry but
+        // is not in the current tool_specs → auto-add it for this and
+        // future iterations.
+        // Trigger B: LLM response says "no suitable tool" → SubAgent
+        // discovery via Memory recall → expand tool_specs.
+        if tool_rag_index.is_some() {
+            let mut expanded = false;
+
+            if !tool_calls.is_empty() {
+                // Trigger A: auto-add undeclared-but-existing tools
+                for call in &tool_calls {
+                    if !selected_tool_names.contains(&call.name)
+                        && tools_registry.iter().any(|t| t.name() == call.name)
+                    {
+                        selected_tool_names.insert(call.name.clone());
+                        expanded = true;
+                        tracing::info!(
+                            tool = %call.name,
+                            "Tool RAG: auto-adding undeclared tool called by LLM"
+                        );
+                    }
+                }
+            } else if !discovery_used {
+                let text_to_check = format!(
+                    "{} {}",
+                    turn_reasoning_content.as_deref().unwrap_or(""),
+                    display_text
+                );
+                if crate::tools::tool_rag::looks_like_tool_insufficient(&text_to_check) {
+                // Trigger B: SubAgent discovery
+                let rag_index = tool_rag_index.unwrap(); // safe: checked is_some above
+                let user_msg = history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.as_str())
+                    .unwrap_or("");
+                let current: Vec<String> = selected_tool_names.iter().cloned().collect();
+                match rag_index
+                    .discover_tools(provider, model, user_msg, &current, &display_text)
+                    .await
+                {
+                    Ok(discovered) if !discovered.is_empty() => {
+                        for name in &discovered {
+                            selected_tool_names.insert(name.clone());
+                        }
+                        expanded = true;
+                        tracing::info!(
+                            discovered_count = discovered.len(),
+                            discovered = ?discovered,
+                            "Tool RAG: SubAgent discovered additional tools"
+                        );
+                        // Inject a hint so the LLM knows new tools are available
+                        let tool_names = discovered.join(", ");
+                        history.push(ChatMessage::assistant(display_text.clone()));
+                        history.push(ChatMessage::user(format!(
+                            "New tools have been loaded: {tool_names}. \
+                             Please try again using the appropriate tool."
+                        )));
+                    }
+                    Ok(_) => {
+                        tracing::debug!("Tool RAG: SubAgent discovery found no new tools");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Tool RAG: SubAgent discovery failed");
+                    }
+                }
+                discovery_used = true;
+            }
+        }
+
+        if expanded {
+                // Rebuild tool_specs with the expanded set
+                tool_specs = tools_registry
+                    .iter()
+                    .filter(|t| !excluded_tools.iter().any(|ex| ex == t.name()))
+                    .filter(|t| selected_tool_names.contains(t.name()))
+                    .map(|t| t.spec())
+                    .collect();
+                tracing::info!(
+                    new_count = tool_specs.len(),
+                    "Tool RAG: tool_specs expanded, continuing loop"
+                );
+                // For trigger B, we already pushed history; just continue
+                // For trigger A, let the normal execution proceed (don't continue)
+                if tool_calls.is_empty() {
+                    continue;
                 }
             }
         }
@@ -2000,6 +2144,16 @@ pub async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
+
+            // Record this turn's tools into the RAG cache for reuse in follow-up turns
+            if let Some(rag_index) = tool_rag_index {
+                rag_index.record_turn_tools(&selected_tool_names);
+                tracing::debug!(
+                    cached_tool_count = selected_tool_names.len(),
+                    "Tool RAG: recorded turn tools into cache"
+                );
+            }
+
             return Ok(display_text);
         }
 
@@ -2517,6 +2671,59 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     build_tool_instructions_from_specs(&specs)
 }
 
+pub(crate) fn build_runtime_tool_visibility_prompt(
+    specs: &[crate::tools::ToolSpec],
+    excluded_tools: &[String],
+    native_tools: bool,
+) -> String {
+    let mut prompt = String::new();
+    let mut specs = specs.to_vec();
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    use std::fmt::Write;
+    prompt.push_str("\n## Runtime Tool Availability (Authoritative)\n\n");
+    prompt.push_str(
+        "This section is generated from current runtime policy for this message. \
+         Only the listed tools may be called in this turn.\n\n",
+    );
+
+    if specs.is_empty() {
+        prompt.push_str("- Allowed tools: (none)\n");
+    } else {
+        let _ = writeln!(prompt, "- Allowed tools ({}):", specs.len());
+        for spec in &specs {
+            let _ = writeln!(prompt, "  - `{}`", spec.name);
+        }
+    }
+
+    if excluded_tools.is_empty() {
+        prompt.push_str("- Excluded by runtime policy: (none)\n\n");
+    } else {
+        let mut excluded_sorted = excluded_tools.to_vec();
+        excluded_sorted.sort();
+        let _ = writeln!(
+            prompt,
+            "- Excluded by runtime policy: {}\n",
+            excluded_sorted.join(", ")
+        );
+    }
+
+    if native_tools {
+        prompt.push_str(
+            "Tool calling for this turn uses native provider function-calling. \
+             Do not emit `<tool_call>` XML tags.\n",
+        );
+    } else {
+        prompt.push_str(
+            "Tool calling for this turn uses XML tool protocol below. \
+             This protocol block is generated from the same runtime policy snapshot.\n",
+        );
+        prompt.push_str(&build_tool_instructions_from_specs(&specs));
+    }
+
+    prompt
+}
+
 /// Build the tool instruction block for the system prompt from concrete tool
 /// specs so the LLM knows how to invoke tools.
 pub(crate) fn build_tool_instructions_from_specs(tool_specs: &[crate::tools::ToolSpec]) -> String {
@@ -2915,6 +3122,7 @@ pub async fn run(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.tools_injection_mode,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2938,6 +3146,30 @@ pub async fn run(
     let start = Instant::now();
     let cost_enforcement_context =
         create_cost_enforcement_context(&config.cost, &config.workspace_dir);
+
+    let tools_injection_mode = config.agent.tools_injection_mode;
+    let tool_rag_index = if matches!(
+        tools_injection_mode,
+        crate::config::schema::ToolsInjectionMode::Rag
+    ) {
+        let index = crate::tools::tool_rag::ToolRagIndex::new(
+            mem.clone(),
+            config.agent.tools_rag_core_set.clone(),
+            config.agent.tools_rag_top_k,
+            config.agent.tools_rag_threshold,
+            config.agent.tools_rag_enable_discovery,
+            config.agent.tools_rag_cache_window,
+        );
+
+        // Register tools on startup in RAG mode
+        index
+            .register_tools(&tools_registry, provider.as_ref(), &model_name)
+            .await?;
+
+        Some(index)
+    } else {
+        None
+    };
 
     let mut final_output = String::new();
 
@@ -3009,6 +3241,7 @@ pub async fn run(
                             None,
                             effective_hooks,
                             &[],
+                            tool_rag_index.as_ref(),
                         ),
                     ),
                 ),
@@ -3238,6 +3471,7 @@ pub async fn run(
                                 None,
                                 effective_hooks,
                                 &[],
+                                tool_rag_index.as_ref(),
                             ),
                         ),
                     ),
@@ -3542,6 +3776,7 @@ pub async fn process_message_with_session(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.tools_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -3583,6 +3818,30 @@ pub async fn process_message_with_session(
     } else {
         None
     };
+    let tools_injection_mode = config.agent.tools_injection_mode;
+    let tool_rag_index = if matches!(
+        tools_injection_mode,
+        crate::config::schema::ToolsInjectionMode::Rag
+    ) {
+        let index = crate::tools::tool_rag::ToolRagIndex::new(
+            mem.clone(),
+            config.agent.tools_rag_core_set.clone(),
+            config.agent.tools_rag_top_k,
+            config.agent.tools_rag_threshold,
+            config.agent.tools_rag_enable_discovery,
+            config.agent.tools_rag_cache_window,
+        );
+
+        // Register tools on startup in RAG mode
+        index
+            .register_tools(&tools_registry, provider.as_ref(), &model_name)
+            .await?;
+
+        Some(index)
+    } else {
+        None
+    };
+
     let response = scope_cost_enforcement_context(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
@@ -3598,6 +3857,7 @@ pub async fn process_message_with_session(
                 true,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                tool_rag_index.as_ref(),
             ),
         ),
     )
@@ -4258,6 +4518,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4293,6 +4554,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("anthropic route should not fail on a false-negative vision capability probe");
@@ -4330,6 +4592,7 @@ mod tests {
                     None,
                     None,
                     &[],
+            None, // tool_rag_index
                 ),
             )
             .await
@@ -4373,6 +4636,7 @@ mod tests {
                     None,
                     None,
                     &[],
+            None, // tool_rag_index
                 ),
             )
             .await
@@ -4418,6 +4682,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4458,6 +4723,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4654,6 +4920,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("parallel execution should complete");
@@ -4725,6 +4992,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should complete with denied tool execution");
@@ -4784,6 +5052,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should consume non-cli session grants");
@@ -4868,6 +5137,7 @@ mod tests {
             ProgressMode::Verbose,
             None,
             false,
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -4948,6 +5218,7 @@ mod tests {
             ProgressMode::Verbose,
             None,
             false,
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -5005,6 +5276,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should consume one-time allow-all token");
@@ -5060,6 +5332,7 @@ mod tests {
             None,
             None,
             &excluded_tools,
+            None, // tool_rag_index
         )
         .await
         .expect("tool loop should complete with blocked tool execution");
@@ -5124,6 +5397,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5180,6 +5454,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5239,6 +5514,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("loop should recover after one deferred-action reply");
@@ -5287,6 +5563,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect_err("second deferred response without tool call should hard-fail");
@@ -5372,6 +5649,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("truncated native arguments should trigger safe retry");
@@ -5470,6 +5748,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("invalid native args should force retry without text fallback execution");
@@ -5550,6 +5829,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("valid native tool calls must execute even when stop_reason is max_tokens");
@@ -5615,6 +5895,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("max-token continuation should complete");
@@ -5691,6 +5972,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("continuation should degrade to partial output");
@@ -5750,6 +6032,7 @@ mod tests {
             None,
             None,
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("continuation should clamp oversized merge");
@@ -5809,6 +6092,7 @@ mod tests {
             None,
             Some(&hooks),
             &[],
+            None, // tool_rag_index
         )
         .await
         .expect("loop should complete");
@@ -7333,11 +7617,12 @@ Let me check the result."#;
             std::path::Path::new("/tmp"),
             "test-model",
             &tool_summaries,
-            &[],  // no skills
+            &[],
             None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            crate::config::ToolsInjectionMode::Full,
         );
 
         // Must contain zero XML protocol artifacts

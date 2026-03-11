@@ -325,6 +325,7 @@ fn build_ws_system_prompt(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.tools_injection_mode,
     );
     if !native_tools {
         prompt.push_str(&build_tool_instructions_from_specs(&tool_specs));

@@ -43,3 +43,6 @@ credentials.json
 
 # Nix
 result
+
+# envrc
+.direnv/

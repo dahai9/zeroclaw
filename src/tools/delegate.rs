@@ -604,6 +604,7 @@ impl DelegateTool {
                 None,
                 None,
                 &[],
+                None, // tool_rag_index: delegate agents don't use RAG
             ),
         )
         .await;

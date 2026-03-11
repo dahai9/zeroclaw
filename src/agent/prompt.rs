@@ -1,4 +1,4 @@
-use crate::config::IdentityConfig;
+use crate::config::{IdentityConfig, ToolsInjectionMode};
 use crate::identity;
 use crate::skills::Skill;
 use crate::tools::Tool;
@@ -37,6 +37,7 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    pub tools_injection_mode: ToolsInjectionMode,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -155,6 +156,16 @@ impl PromptSection for ToolsSection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
+        if ctx.tools_injection_mode == ToolsInjectionMode::Rag {
+            out.push_str(
+                "You are running with dynamic tool selection (Tools RAG).\n\
+                The exact tools available to you on this turn are provided separately below or strictly via native API tool definitions.\n\
+                \nNote: If you need a tool not currently listed in your API tools array, describe what capability \
+                you need and additional relevant tools will be automatically discovered and provided in the next turn.\n"
+            );
+            return Ok(out);
+        }
+
         for tool in ctx.tools {
             let _ = writeln!(
                 out,
@@ -373,6 +384,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let section = IdentitySection;
@@ -421,6 +433,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let section = IdentitySection;
@@ -468,6 +481,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let section = IdentitySection;
@@ -491,6 +505,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -527,6 +542,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -566,6 +582,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -616,6 +633,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -655,6 +673,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tools_injection_mode: ToolsInjectionMode::Full,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();

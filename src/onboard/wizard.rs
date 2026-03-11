@@ -2515,7 +2515,9 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::env::var("ZEROCLAW_TEST").is_err();
+
+    if !is_interactive {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -7067,6 +7069,7 @@ mod tests {
         let _env_guard = env_lock().lock().await;
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+        let _test_env = EnvVarGuard::set("ZEROCLAW_TEST", "1");
 
         run_quick_setup_with_home(
             credential_override,

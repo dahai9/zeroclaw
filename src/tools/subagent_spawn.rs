@@ -585,6 +585,7 @@ async fn run_agentic_background(
             None,
             None,
             &[],
+            None, // tool_rag_index: subagent backgrounds don't use RAG
         ),
     )
     .await;

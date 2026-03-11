@@ -25,9 +25,10 @@ pub use schema::{
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
     SecurityRoleConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, SubAgentsConfig,
-    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, ToolsInjectionMode, TunnelConfig, UrlAccessConfig,
-    WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy, WasmRuntimeConfig,
-    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig, DEFAULT_MODEL_FALLBACK,
+    SyscallAnomalyConfig, TelegramConfig, ToolsInjectionMode, TranscriptionConfig, TunnelConfig,
+    UrlAccessConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy,
+    WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

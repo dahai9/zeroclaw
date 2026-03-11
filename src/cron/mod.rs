@@ -52,7 +52,12 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
     add_job_with_approval(config, expression, command, false)
 }
 
-pub fn add_job_with_approval(config: &Config, expression: &str, command: &str, approved: bool) -> Result<CronJob> {
+pub fn add_job_with_approval(
+    config: &Config,
+    expression: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
         tz: None,
@@ -217,7 +222,12 @@ pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> 
     add_once_with_approval(config, delay, command, false)
 }
 
-pub fn add_once_with_approval(config: &Config, delay: &str, command: &str, approved: bool) -> Result<CronJob> {
+pub fn add_once_with_approval(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
     add_once_at_with_approval(config, at, command, approved)

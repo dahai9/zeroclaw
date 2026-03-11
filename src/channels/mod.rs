@@ -1338,7 +1338,6 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .clone()
 }
 
-
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     let modified = metadata.modified().ok()?;
@@ -7162,7 +7161,6 @@ BTC is currently around $65,000 based on latest tool output."#
             })
         }
     }
-
 
     #[tokio::test]
     async fn process_channel_message_injects_runtime_tool_visibility_prompt() {

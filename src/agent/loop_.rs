@@ -1978,49 +1978,49 @@ pub async fn run_tool_call_loop(
                     display_text
                 );
                 if crate::tools::tool_rag::looks_like_tool_insufficient(&text_to_check) {
-                // Trigger B: SubAgent discovery
-                let rag_index = tool_rag_index.unwrap(); // safe: checked is_some above
-                let user_msg = history
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "user")
-                    .map(|m| m.content.as_str())
-                    .unwrap_or("");
-                let current: Vec<String> = selected_tool_names.iter().cloned().collect();
-                match rag_index
-                    .discover_tools(provider, model, user_msg, &current, &display_text)
-                    .await
-                {
-                    Ok(discovered) if !discovered.is_empty() => {
-                        for name in &discovered {
-                            selected_tool_names.insert(name.clone());
-                        }
-                        expanded = true;
-                        tracing::info!(
-                            discovered_count = discovered.len(),
-                            discovered = ?discovered,
-                            "Tool RAG: SubAgent discovered additional tools"
-                        );
-                        // Inject a hint so the LLM knows new tools are available
-                        let tool_names = discovered.join(", ");
-                        history.push(ChatMessage::assistant(display_text.clone()));
-                        history.push(ChatMessage::user(format!(
-                            "New tools have been loaded: {tool_names}. \
+                    // Trigger B: SubAgent discovery
+                    let rag_index = tool_rag_index.unwrap(); // safe: checked is_some above
+                    let user_msg = history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let current: Vec<String> = selected_tool_names.iter().cloned().collect();
+                    match rag_index
+                        .discover_tools(provider, model, user_msg, &current, &display_text)
+                        .await
+                    {
+                        Ok(discovered) if !discovered.is_empty() => {
+                            for name in &discovered {
+                                selected_tool_names.insert(name.clone());
+                            }
+                            expanded = true;
+                            tracing::info!(
+                                discovered_count = discovered.len(),
+                                discovered = ?discovered,
+                                "Tool RAG: SubAgent discovered additional tools"
+                            );
+                            // Inject a hint so the LLM knows new tools are available
+                            let tool_names = discovered.join(", ");
+                            history.push(ChatMessage::assistant(display_text.clone()));
+                            history.push(ChatMessage::user(format!(
+                                "New tools have been loaded: {tool_names}. \
                              Please try again using the appropriate tool."
-                        )));
+                            )));
+                        }
+                        Ok(_) => {
+                            tracing::debug!("Tool RAG: SubAgent discovery found no new tools");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Tool RAG: SubAgent discovery failed");
+                        }
                     }
-                    Ok(_) => {
-                        tracing::debug!("Tool RAG: SubAgent discovery found no new tools");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tool RAG: SubAgent discovery failed");
-                    }
+                    discovery_used = true;
                 }
-                discovery_used = true;
             }
-        }
 
-        if expanded {
+            if expanded {
                 // Rebuild tool_specs with the expanded set
                 tool_specs = tools_registry
                     .iter()
@@ -4592,7 +4592,7 @@ mod tests {
                     None,
                     None,
                     &[],
-            None, // tool_rag_index
+                    None, // tool_rag_index
                 ),
             )
             .await
@@ -4636,7 +4636,7 @@ mod tests {
                     None,
                     None,
                     &[],
-            None, // tool_rag_index
+                    None, // tool_rag_index
                 ),
             )
             .await

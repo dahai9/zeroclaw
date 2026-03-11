@@ -2515,7 +2515,9 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::env::var("ZEROCLAW_TEST").is_err();
+    let is_interactive = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::env::var("ZEROCLAW_TEST").is_err();
 
     if !is_interactive {
         bail!(

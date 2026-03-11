@@ -6519,6 +6519,67 @@ async fn scaffold_workspace(
          {session_memory_steps}\n\n\
          Don't ask permission. Just do it.\n\n\
          {memory_system_block}\n\n\
+         ## 🛠 Dynamic Tool Invocation & Discovery (Dynamic Tool RAG)\n\n\
+         To optimize token usage, the system uses a **JIT (Just-in-Time) tool injection mechanism**. The list of tools currently visible to you has been **dynamically filtered based on your needs**.\n\n\
+         ### 1. Discovery Mechanism\n\
+         If you find that the current toolbox **lacks a key capability** required to complete the task (for example: accessing web pages, making HTTP API requests, performing deep system searches, etc.), **do not directly refuse the user**.\n\n\
+         ### 2. How to Trigger New Tool Injection\n\
+         You only need to **explicitly describe the “capability” or “tool” you need** in your reply (or in the chain-of-thought reasoning).\n\
+         The system monitor will capture these signals and trigger the **SubAgent discovery process**.\n\n\
+         **Example trigger phrases (include similar wording in your reply):**\n\n\
+         ```rust\n\
+         SIGNALS: &[&str] = &[\n\
+                 // English signals\n\
+                 \"don't have\",\n\
+                 \"do not have\",\n\
+                 \"no tool\",\n\
+                 \"no suitable tool\",\n\
+                 \"cannot find a tool\",\n\
+                 \"not available\",\n\
+                 \"lack of tool\",\n\
+                 \"no appropriate tool\",\n\
+                 \"i don't have access to\",\n\
+                 \"unable to\",\n\
+                 \"i cannot\",\n\
+                 \"no way to\",\n\
+                 \"need a tool\",\n\
+                 \"require a tool\",\n\
+                 \"capability needed\",\n\
+                 \"tool needed\",\n\
+                 \"need the capability\",\n\
+                 \"need access to\",\n\
+                 \"don't have real-time\",\n\
+                 \"no real-time data\",\n\
+                 \"cannot fetch\",\n\
+                 \"unable to fetch\",\n\
+                 \"unable to access internet\",\n\
+                 \"cannot access the internet\",\n\n\
+                 // Chinese signals\n\
+                 \"没有合适\",\n\
+                 \"没有工具\",\n\
+                 \"无法找到\",\n\
+                 \"缺少工具\",\n\
+                 \"没有可用的\",\n\
+                 \"无法使用\",\n\
+                 \"需要工具\",\n\
+                 \"需要一个工具\",\n\
+                 \"需要使用工具\",\n\
+                 \"需要相关工具\",\n\
+                 \"需要访问\",\n\
+                 \"没有实时数据\",\n\
+                 \"无法直接获取\",\n\
+                 \"无法获取\",\n\
+                 \"无法查询\",\n\
+                 \"我没有\",\n\
+                 \"我无法\",\n\
+         ];\n\
+         ```\n\
+         This is a signal list. If the user message contains any of these signals, the system will trigger the SubAgent discovery process.\n\n\
+         ### 3. Core Principle\n\
+         Do NOT say:\n\
+         “I cannot do this because I don’t have that tool.”\n\
+         Instead say:\n\
+         “To complete this task, I need the capability to [specific function]. Please wait while I attempt to locate and load the relevant tool.”\n\n\
          ## Safety\n\n\
          - Don't exfiltrate private data. Ever.\n\
          - Don't run destructive commands without asking.\n\

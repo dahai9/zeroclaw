@@ -136,6 +136,12 @@ Operational note for container users:
 | `loop_detection_no_progress_threshold` | `3` | Same tool+args producing identical output this many times triggers loop detection. `0` disables |
 | `loop_detection_ping_pong_cycles` | `2` | A→B→A→B alternating pattern cycle count threshold. `0` disables |
 | `loop_detection_failure_streak` | `3` | Same tool consecutive failure count threshold. `0` disables |
+| `tools_injection_mode` | `full` | Tool injection mode: `full` (all tools every turn) or `rag` (semantic selection) |
+| `tools_rag_top_k` | `12` | Max number of tools to retrieve in RAG mode |
+| `tools_rag_threshold` | `0.3` | Vector similarity threshold for RAG retrieval |
+| `tools_rag_core_set` | `["shell", "file_read", ...]` | Tools always included regardless of RAG score |
+| `tools_rag_enable_discovery` | `true` | Enable SubAgent discovery fallback when tools are insufficient |
+| `tools_rag_cache_window` | `5` | Number of recent turns to cache discovered tools |
 
 Notes:
 
